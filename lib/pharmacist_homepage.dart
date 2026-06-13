@@ -30,6 +30,8 @@ class _PharmacistHomeState extends State<PharmacistHome> {
   bool isSearching = false;
   bool hasSearched = false;
 
+  // ── POINT 3: Low stock now uses AGGREGATED stock per trade name ──
+  // lowStockMeds holds one entry per trade name with combined qty
   List<Map<String, dynamic>> lowStockMeds = [];
   List<Map<String, dynamic>> expiringMeds = [];
 
@@ -117,6 +119,10 @@ class _PharmacistHomeState extends State<PharmacistHome> {
     }
   }
 
+  // ── POINT 3: Aggregated low stock warnings ───────────────────────────────
+  // Instead of checking each batch row individually,
+  // we group all rows by medicine_name (trade name) and sum their quantities.
+  // A low stock warning is shown only when the TOTAL quantity <= 5.
   Future<void> _loadAlerts() async {
     setState(() => loadingAlerts = true);
     try {
@@ -128,15 +134,69 @@ class _PharmacistHomeState extends State<PharmacistHome> {
       final in30Str =
           '${in30.year}-${in30.month.toString().padLeft(2, '0')}-${in30.day.toString().padLeft(2, '0')}';
 
-      final low = await supabase
+      // Fetch ALL active medicine boxes with quantity > 0
+      // We will aggregate them by trade name (medicine_name) in Dart
+      final allActiveBoxes = await supabase
           .from('medicine_boxes')
           .select()
           .eq('pharmacy_id', pid)
           .gt('quantity', 0)
-          .lte('quantity', 5)
-          .order('quantity', ascending: true)
-          .limit(5);
+          .eq('is_active', true);
 
+      // Group by medicine_name and sum quantities
+      // Map<tradeName, {totalQty, representativeRow}>
+      final Map<String, Map<String, dynamic>> groupedByTradeName = {};
+
+      for (final box in allActiveBoxes) {
+        final String tradeName = (box['medicine_name'] ?? '').toString().trim();
+        if (tradeName.isEmpty) continue;
+
+        final int qty = (box['quantity'] as int?) ?? 0;
+
+        if (!groupedByTradeName.containsKey(tradeName)) {
+          // Store a copy of this row as the representative entry
+          groupedByTradeName[tradeName] = {
+            ...Map<String, dynamic>.from(box),
+            'totalQuantity': qty, // we track total separately
+          };
+        } else {
+          // Add quantity to existing group total
+          final int existing =
+              (groupedByTradeName[tradeName]!['totalQuantity'] as int?) ?? 0;
+          groupedByTradeName[tradeName]!['totalQuantity'] = existing + qty;
+        }
+      }
+
+      // Now find trade names where TOTAL quantity <= 5 (low stock threshold)
+      // Sort by total quantity ascending, take top 5
+      final List<Map<String, dynamic>> aggregatedLowStock = [];
+
+      for (final entry in groupedByTradeName.values) {
+        final int totalQty = (entry['totalQuantity'] as int?) ?? 0;
+        // Low stock: combined total across all batches <= 5
+        if (totalQty <= 5) {
+          // Update the quantity field to show the combined total in the UI
+          final Map<String, dynamic> displayEntry = Map<String, dynamic>.from(
+            entry,
+          );
+          displayEntry['quantity'] = totalQty; // show combined total in UI
+          aggregatedLowStock.add(displayEntry);
+        }
+      }
+
+      // Sort by total quantity ascending (lowest stock first)
+      aggregatedLowStock.sort((a, b) {
+        final int qa = (a['quantity'] as int?) ?? 0;
+        final int qb = (b['quantity'] as int?) ?? 0;
+        return qa.compareTo(qb);
+      });
+
+      // Take only top 5 for dashboard display
+      final List<Map<String, dynamic>> topLowStock = aggregatedLowStock
+          .take(5)
+          .toList();
+
+      // Expiring soon: fetch per-batch (this stays unchanged — batch-level is correct for expiry)
       final expiring = await supabase
           .from('medicine_boxes')
           .select()
@@ -147,7 +207,7 @@ class _PharmacistHomeState extends State<PharmacistHome> {
           .limit(5);
 
       setState(() {
-        lowStockMeds = List<Map<String, dynamic>>.from(low);
+        lowStockMeds = topLowStock;
         expiringMeds = List<Map<String, dynamic>>.from(expiring);
         loadingAlerts = false;
       });
@@ -156,6 +216,15 @@ class _PharmacistHomeState extends State<PharmacistHome> {
     }
   }
 
+  // ── POINT 1: Search by trade name (medicine_name), generic name, and batch ──
+  // Previously searched: medicine_name, generic_name, batch_number
+  // Now also finds medicines by trade name → shows all with same generic
+  //
+  // How trade name search works:
+  // Step 1: Search for any row matching the query (name/generic/batch)
+  // Step 2: If results found via trade name match, also fetch all medicines
+  //         with the SAME generic name (so substitutes are shown)
+  // Step 3: Combine and deduplicate results
   Future<void> _search(String query) async {
     if (query.trim().isEmpty) {
       setState(() {
@@ -168,7 +237,10 @@ class _PharmacistHomeState extends State<PharmacistHome> {
     try {
       final pid = PharmacySession.pharmacyId ?? '';
       final q = query.trim();
-      final res = await supabase
+
+      // Step 1: Search by medicine_name (trade name), generic_name, and batch_number
+      // This already handles trade name search via medicine_name
+      final directResults = await supabase
           .from('medicine_boxes')
           .select('*, cartons(*, manufacturers(name, country))')
           .eq('pharmacy_id', pid)
@@ -177,8 +249,65 @@ class _PharmacistHomeState extends State<PharmacistHome> {
           )
           .order('expiry_date', ascending: true);
 
+      final List<Map<String, dynamic>> directList =
+          List<Map<String, dynamic>>.from(directResults);
+
+      // Step 2: Find all unique generic names from the direct results
+      // This allows trade name search to show all substitutes with same generic
+      final Set<String> genericNames = {};
+      for (final row in directList) {
+        final String generic = (row['generic_name'] ?? '').toString().trim();
+        if (generic.isNotEmpty) {
+          genericNames.add(generic.toLowerCase());
+        }
+      }
+
+      // Step 3: If we found any generic names, fetch ALL medicines with those generics
+      // This is the key part: searching "Napa" → finds generic "Paracetamol"
+      // → then fetches Ace, Fast, etc. (all Paracetamol medicines = substitutes)
+      final Set<String> foundIds = {};
+      final List<Map<String, dynamic>> allResults = [];
+
+      // Add direct results first
+      for (final row in directList) {
+        final String id = row['id']?.toString() ?? '';
+        if (id.isNotEmpty && !foundIds.contains(id)) {
+          foundIds.add(id);
+          allResults.add(row);
+        }
+      }
+
+      // Fetch substitutes for each found generic name
+      for (final genericName in genericNames) {
+        final substituteResults = await supabase
+            .from('medicine_boxes')
+            .select('*, cartons(*, manufacturers(name, country))')
+            .eq('pharmacy_id', pid)
+            .ilike('generic_name', '%$genericName%')
+            .order('expiry_date', ascending: true);
+
+        for (final row in List<Map<String, dynamic>>.from(substituteResults)) {
+          final String id = row['id']?.toString() ?? '';
+          if (id.isNotEmpty && !foundIds.contains(id)) {
+            foundIds.add(id);
+            allResults.add(row);
+          }
+        }
+      }
+
+      // Sort combined results by expiry date
+      allResults.sort((a, b) {
+        final da =
+            DateTime.tryParse(a['expiry_date']?.toString() ?? '') ??
+            DateTime(2100);
+        final db =
+            DateTime.tryParse(b['expiry_date']?.toString() ?? '') ??
+            DateTime(2100);
+        return da.compareTo(db);
+      });
+
       setState(() {
-        searchResults = List<Map<String, dynamic>>.from(res);
+        searchResults = allResults;
         hasSearched = true;
         isSearching = false;
       });
@@ -552,6 +681,7 @@ class _PharmacistHomeState extends State<PharmacistHome> {
                   const SizedBox(height: 16),
 
                   // INVENTORY & MEDICINE LOOKUP
+                  // Updated hint text to mention trade name search
                   _sectionTitle('🔍 Inventory & Medicine Lookup'),
                   const SizedBox(height: 8),
                   Row(
@@ -574,7 +704,9 @@ class _PharmacistHomeState extends State<PharmacistHome> {
                             onChanged: _search,
                             onSubmitted: _search,
                             decoration: InputDecoration(
-                              hintText: 'Search name, generic, batch...',
+                              // Updated hint to show trade name is supported
+                              hintText:
+                                  'Search by name, trade name, generic, batch...',
                               hintStyle: const TextStyle(
                                 color: Colors.white38,
                                 fontSize: 13,
@@ -685,7 +817,7 @@ class _PharmacistHomeState extends State<PharmacistHome> {
                               ),
                             ),
                             Text(
-                              'Try generic name or batch number',
+                              'Try trade name, generic name or batch number',
                               style: TextStyle(
                                 color: Colors.white38,
                                 fontSize: 12,
@@ -742,8 +874,10 @@ class _PharmacistHomeState extends State<PharmacistHome> {
                       const SizedBox(height: 12),
                     ],
 
+                    // POINT 3: Low stock section now shows aggregated totals
+                    // The lowStockMeds list is already filtered by combined qty <= 5
                     if (lowStockMeds.isNotEmpty) ...[
-                      _sectionTitle('📉 Low Stock'),
+                      _sectionTitle('📉 Low Stock (Combined Total ≤ 5 boxes)'),
                       const SizedBox(height: 8),
                       ...lowStockMeds.map(
                         (m) => _alertCard(m, isExpiry: false),
@@ -886,6 +1020,7 @@ class _PharmacistHomeState extends State<PharmacistHome> {
     );
   }
 
+  // ── Alert card: for low stock, qty now shows the COMBINED total ──
   Widget _alertCard(Map<String, dynamic> m, {required bool isExpiry}) {
     final int qty = (m['quantity'] as int?) ?? 0;
     final Color color = isExpiry ? Colors.orange : Colors.redAccent;
@@ -926,8 +1061,9 @@ class _PharmacistHomeState extends State<PharmacistHome> {
                       style: TextStyle(color: color, fontSize: 11),
                     )
                   else
+                    // For low stock: qty is already the COMBINED total from _loadAlerts()
                     Text(
-                      '$qty boxes remaining',
+                      '$qty boxes remaining (all batches combined)',
                       style: const TextStyle(
                         color: Colors.white54,
                         fontSize: 11,
