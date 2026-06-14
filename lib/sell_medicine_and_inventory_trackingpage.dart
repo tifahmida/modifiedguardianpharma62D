@@ -462,7 +462,6 @@ class _SellMedicineAndInventoryPageState
 
   // ── POINT 3: Low stock threshold ──────────────────────────
   // A medicine is flagged as low stock when its COMBINED total boxes <= this value.
-  // This applies in the Sell tab badge. The home dashboard uses the same rule.
   static const int _lowStockThreshold = 5;
 
   @override
@@ -472,11 +471,8 @@ class _SellMedicineAndInventoryPageState
     _tabController.addListener(() => setState(() {}));
     _loadMedicines();
     _loadManufacturers();
-    // Rebuild the sell list whenever the search field changes.
     searchController.addListener(() => setState(() {}));
 
-    // If launched from a barcode scan / notification with a pre-selected
-    // medicine name, open its sell dialog after the first frame.
     final preSelected = widget.preSelected;
     if (preSelected != null) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -538,26 +534,13 @@ class _SellMedicineAndInventoryPageState
     }
   }
 
-  // ── POINT 2: GROUPING BY TRADE NAME ────────────────────────
-  //
-  // Sell tab shows ONE entry per medicine_name (trade name).
-  // All batches with the same trade name are merged into one group.
-  // Total stock = sum of all non-expired batches for that trade name.
-  //
-  // Inventory tab (carton view): unchanged — each batch shown separately.
-  //
-  // Each group map contains:
-  //   medicine_name, generic_name, manufacturer, price,
-  //   batches (FIFO sorted by expiry), totalBoxes, totalStrips,
-  //   cartonCount, earliestExpiry, allExpired
+  // ── GROUPING BY TRADE NAME ─────────────────────────────────
   List<Map<String, dynamic>> _buildGroups() {
-    // Step 1: Group all batch rows by medicine_name (trade name)
     final Map<String, Map<String, dynamic>> groups = {};
 
     for (final m in allMedicines) {
       final String name = (m['medicine_name'] ?? '').toString();
       groups.putIfAbsent(name, () {
-        // First batch for this trade name becomes the representative entry
         return {
           'medicine_name': name,
           'generic_name': m['generic_name'] ?? '',
@@ -567,7 +550,6 @@ class _SellMedicineAndInventoryPageState
           'batches': <Map<String, dynamic>>[],
         };
       });
-      // Add this batch row to the group
       (groups[name]!['batches'] as List<Map<String, dynamic>>).add(m);
     }
 
@@ -578,7 +560,6 @@ class _SellMedicineAndInventoryPageState
       final List<Map<String, dynamic>> batches =
           List<Map<String, dynamic>>.from(g['batches']);
 
-      // FIFO: sell from the batch expiring soonest first.
       batches.sort((a, b) {
         final da =
             DateTime.tryParse(a['expiry_date']?.toString() ?? '') ??
@@ -590,8 +571,6 @@ class _SellMedicineAndInventoryPageState
       });
       g['batches'] = batches;
 
-      // Step 2: Sum totals across ALL non-expired batches for this trade name
-      // This is the key fix for Point 2: combined stock for one trade name entry
       int totalBoxes = 0;
       int totalStrips = 0;
       final Set<String> cartonIds = {};
@@ -615,7 +594,6 @@ class _SellMedicineAndInventoryPageState
           batches.isNotEmpty &&
           batches.every((b) => _isExpired(b['expiry_date']?.toString()));
 
-      // Search filter: match trade name, generic, manufacturer, or any batch number
       if (q.isNotEmpty) {
         final nameLow = (g['medicine_name'] ?? '').toString().toLowerCase();
         final generic = (g['generic_name'] ?? '').toString().toLowerCase();
@@ -642,7 +620,6 @@ class _SellMedicineAndInventoryPageState
     return result;
   }
 
-  // Find a group by medicine name (used by preSelected / barcode flow).
   Map<String, dynamic>? _findGroupByName(String medicineName) {
     for (final g in _buildGroups()) {
       if (g['medicine_name'] == medicineName) return g;
@@ -661,13 +638,6 @@ class _SellMedicineAndInventoryPageState
   }
 
   // ── STRIP EQUIVALENT ───────────────────────────────────────
-  //
-  // Converts any sale unit into the number of strips being sold.
-  // Used to decide whether OTP is needed.
-  //
-  //   strip  → qty strips
-  //   box    → qty × stripsPerBox
-  //   carton → ALL strips currently in stock (clears everything)
   int _calculateStripEquivalent({
     required String saleType,
     required int qty,
@@ -676,7 +646,7 @@ class _SellMedicineAndInventoryPageState
   }) {
     if (saleType == 'strip') return qty;
     if (saleType == 'box') return qty * stripsPerBox;
-    return totalStripsInStock; // carton clears all stock
+    return totalStripsInStock;
   }
 
   // ── HELPERS ────────────────────────────────────────────────
@@ -759,9 +729,7 @@ class _SellMedicineAndInventoryPageState
     }
   }
 
-  // ── SOFT DELETE ────────────────────────────────────────────
-  // Sets is_active = false instead of hard-deleting.
-  // Keeps all sales history and suspicious logs intact.
+  // ── SOFT DELETE (Archive) ──────────────────────────────────
   Future<void> _archiveMedicineBox(String medicineId) async {
     await supabase
         .from('medicine_boxes')
@@ -769,12 +737,368 @@ class _SellMedicineAndInventoryPageState
         .eq('id', medicineId);
   }
 
-  // ── SELL DIALOG ────────────────────────────────────────────
-  //
-  // Receives a GROUP (all batches of one trade name, FIFO sorted).
-  // Shows COMBINED stock across all batches.
-  // Deducts from earliest-expiry batch first (FIFO) on confirm.
+  // ── UNARCHIVE (Restore) ────────────────────────────────────
+  // Sets is_active = true so the medicine shows up again in active stock.
+  Future<void> _unarchiveMedicineBox(String medicineId) async {
+    await supabase
+        .from('medicine_boxes')
+        .update({'is_active': true})
+        .eq('id', medicineId);
+  }
 
+  // ── VIEW ARCHIVED MEDICINES ────────────────────────────────
+  // Opens a bottom sheet listing all archived (is_active = false) medicine boxes.
+  // Each row has a "Restore" button to unarchive it.
+  void _showArchivedMedicines() async {
+    // Show loading while we fetch
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const Center(
+        child: CircularProgressIndicator(color: Colors.blueAccent),
+      ),
+    );
+
+    List<Map<String, dynamic>> archivedList = [];
+    try {
+      final res = await supabase
+          .from('medicine_boxes')
+          .select('*, cartons(*, manufacturers(name, country))')
+          .eq('pharmacy_id', PharmacySession.pharmacyId ?? '')
+          .eq('is_active', false)
+          .order('medicine_name');
+      archivedList = List<Map<String, dynamic>>.from(res);
+    } catch (e) {
+      if (mounted) Navigator.pop(context); // close loading
+      _error('Failed to load archived medicines: $e');
+      return;
+    }
+
+    if (!mounted) return;
+    Navigator.pop(context); // close loading
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1A1A2E),
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => StatefulBuilder(
+        builder: (ctx, setSheet) => DraggableScrollableSheet(
+          expand: false,
+          initialChildSize: 0.85,
+          maxChildSize: 0.95,
+          builder: (_, scrollCtrl) => Column(
+            children: [
+              // ── Header ──────────────────────────────────────
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+                child: Row(
+                  children: [
+                    const Icon(Icons.archive, color: Colors.orangeAccent),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'Archived Medicines',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 16,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          Text(
+                            '${archivedList.length} item(s) archived',
+                            style: const TextStyle(
+                              color: Colors.white54,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close, color: Colors.white54),
+                      onPressed: () => Navigator.pop(ctx),
+                    ),
+                  ],
+                ),
+              ),
+              const Divider(color: Colors.white12),
+              // ── Info box ─────────────────────────────────────
+              Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 8,
+                ),
+                child: Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: const Color.fromRGBO(255, 152, 0, 0.10),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(
+                      color: const Color.fromRGBO(255, 152, 0, 0.35),
+                    ),
+                  ),
+                  child: const Row(
+                    children: [
+                      Icon(Icons.info_outline, color: Colors.orange, size: 14),
+                      SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'Tap "Restore" on any medicine to bring it back into active stock.',
+                          style: TextStyle(color: Colors.orange, fontSize: 12),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              // ── List ─────────────────────────────────────────
+              Expanded(
+                child: archivedList.isEmpty
+                    ? const Center(
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(
+                              Icons.inventory_2_outlined,
+                              color: Colors.white24,
+                              size: 60,
+                            ),
+                            SizedBox(height: 12),
+                            Text(
+                              'No archived medicines',
+                              style: TextStyle(color: Colors.white54),
+                            ),
+                          ],
+                        ),
+                      )
+                    : ListView.builder(
+                        controller: scrollCtrl,
+                        padding: const EdgeInsets.symmetric(horizontal: 16),
+                        itemCount: archivedList.length,
+                        itemBuilder: (_, i) {
+                          final m = archivedList[i];
+                          final String medId = m['id'].toString();
+                          final String medicineName =
+                              m['medicine_name']?.toString() ?? 'Unknown';
+                          final String genericName =
+                              m['generic_name']?.toString() ?? '';
+                          final String batchNum =
+                              m['batch_number']?.toString() ?? 'N/A';
+                          final int qty = (m['quantity'] as int?) ?? 0;
+                          final int spb = (m['strips_per_box'] as int?) ?? 10;
+                          final int stripsRem =
+                              (m['strips_remaining'] as int?) ?? (qty * spb);
+                          final String expiry =
+                              m['expiry_date']?.toString() ?? 'N/A';
+                          final String mfr =
+                              m['cartons']?['manufacturers']?['name']
+                                  ?.toString() ??
+                              'Unknown';
+
+                          return Container(
+                            margin: const EdgeInsets.only(bottom: 10),
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: const Color.fromRGBO(255, 255, 255, 0.06),
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: const Color.fromRGBO(255, 152, 0, 0.30),
+                              ),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                // Medicine name + restore button
+                                Row(
+                                  children: [
+                                    const Icon(
+                                      Icons.archive,
+                                      color: Colors.orangeAccent,
+                                      size: 16,
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            medicineName,
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 14,
+                                            ),
+                                          ),
+                                          if (genericName.isNotEmpty)
+                                            Text(
+                                              genericName,
+                                              style: const TextStyle(
+                                                color: Colors.blueAccent,
+                                                fontSize: 12,
+                                              ),
+                                            ),
+                                        ],
+                                      ),
+                                    ),
+                                    // Restore button
+                                    ElevatedButton.icon(
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: Colors.greenAccent,
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 10,
+                                          vertical: 6,
+                                        ),
+                                      ),
+                                      icon: const Icon(
+                                        Icons.restore,
+                                        color: Colors.black,
+                                        size: 14,
+                                      ),
+                                      label: const Text(
+                                        'Restore',
+                                        style: TextStyle(
+                                          color: Colors.black,
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                      onPressed: () async {
+                                        // Ask for confirmation before restoring
+                                        final bool?
+                                        confirm = await showDialog<bool>(
+                                          context: ctx,
+                                          builder: (_) => AlertDialog(
+                                            backgroundColor: const Color(
+                                              0xFF1A1A2E,
+                                            ),
+                                            title: const Text(
+                                              'Restore Medicine?',
+                                              style: TextStyle(
+                                                color: Colors.white,
+                                                fontWeight: FontWeight.bold,
+                                              ),
+                                            ),
+                                            content: Text(
+                                              'This will restore "$medicineName" (Batch: $batchNum) '
+                                              'back to active stock with $qty box(es) and $stripsRem strips.',
+                                              style: const TextStyle(
+                                                color: Colors.white70,
+                                              ),
+                                            ),
+                                            actions: [
+                                              TextButton(
+                                                onPressed: () => Navigator.pop(
+                                                  context,
+                                                  false,
+                                                ),
+                                                child: const Text(
+                                                  'Cancel',
+                                                  style: TextStyle(
+                                                    color: Colors.white54,
+                                                  ),
+                                                ),
+                                              ),
+                                              ElevatedButton(
+                                                style: ElevatedButton.styleFrom(
+                                                  backgroundColor:
+                                                      Colors.greenAccent,
+                                                ),
+                                                onPressed: () => Navigator.pop(
+                                                  context,
+                                                  true,
+                                                ),
+                                                child: const Text(
+                                                  'Yes, Restore',
+                                                  style: TextStyle(
+                                                    color: Colors.black,
+                                                    fontWeight: FontWeight.bold,
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        );
+
+                                        if (confirm == true) {
+                                          try {
+                                            await _unarchiveMedicineBox(medId);
+                                            // Remove from local list and refresh UI
+                                            setSheet(() {
+                                              archivedList.removeAt(i);
+                                            });
+                                            _loadMedicines(); // refresh active list too
+                                            _success(
+                                              '✅ "$medicineName" restored to active stock!',
+                                            );
+                                          } catch (e) {
+                                            _error('Restore failed: $e');
+                                          }
+                                        }
+                                      },
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 8),
+                                // Details row
+                                Wrap(
+                                  spacing: 6,
+                                  runSpacing: 4,
+                                  children: [
+                                    _archivedChip(
+                                      '🔢 Batch: $batchNum',
+                                      Colors.white54,
+                                    ),
+                                    _archivedChip(
+                                      '📦 $qty boxes',
+                                      Colors.blueAccent,
+                                    ),
+                                    _archivedChip(
+                                      '💊 $stripsRem strips',
+                                      Colors.tealAccent,
+                                    ),
+                                    _archivedChip('🏭 $mfr', Colors.white54),
+                                    _archivedChip(
+                                      '📅 Expiry: $expiry',
+                                      _isExpired(expiry)
+                                          ? Colors.redAccent
+                                          : Colors.white54,
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // Small chip widget used only in the archived list
+  Widget _archivedChip(String label, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: color.withValues(alpha: 0.35)),
+      ),
+      child: Text(label, style: TextStyle(color: color, fontSize: 11)),
+    );
+  }
+
+  // ── SELL DIALOG ────────────────────────────────────────────
   void _showSellDialog(Map<String, dynamic> groupData) {
     final String medicineName = groupData['medicine_name']?.toString() ?? '';
     final String genericName = groupData['generic_name']?.toString() ?? '';
@@ -783,13 +1107,11 @@ class _SellMedicineAndInventoryPageState
     final List<Map<String, dynamic>> allBatches =
         List<Map<String, dynamic>>.from(groupData['batches']);
 
-    // Only use batches that are not expired and still have strips.
     final List<Map<String, dynamic>> usableBatches = allBatches.where((b) {
       final bool expired = _isExpired(b['expiry_date']?.toString());
       final int strips = (b['strips_remaining'] as int?) ?? 0;
       return !expired && strips > 0;
     }).toList();
-    // Already FIFO-sorted by _buildGroups().
 
     if (usableBatches.isEmpty) {
       final bool allExpired = (groupData['allExpired'] as bool?) ?? false;
@@ -801,10 +1123,8 @@ class _SellMedicineAndInventoryPageState
       return;
     }
 
-    // Primary batch = earliest expiry (first in FIFO list).
     final Map<String, dynamic> primary = usableBatches.first;
 
-    // Sum totals across all usable batches for this trade name.
     int totalStripsAvailable = 0;
     int availableBoxes = 0;
     for (final b in usableBatches) {
@@ -820,14 +1140,12 @@ class _SellMedicineAndInventoryPageState
               (pricePerBox / stripsPerBox)
         : pricePerBox / stripsPerBox;
 
-    // Batch label shown in the dialog.
     final String batchNumber = usableBatches.length == 1
         ? (usableBatches.first['batch_number']?.toString() ?? 'N/A')
         : '${usableBatches.length} batches (FIFO)';
     final String expiry = primary['expiry_date']?.toString() ?? 'N/A';
     final int safeLimit = _getSafeLimit(medicineName);
 
-    // Carton selling clears ONE logical carton (all stock of this medicine).
     const int availableCartons = 1;
 
     String saleType = 'strip';
@@ -910,7 +1228,6 @@ class _SellMedicineAndInventoryPageState
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // ── INFO BOX ────────────────────────────────
                   Container(
                     padding: const EdgeInsets.all(12),
                     decoration: BoxDecoration(
@@ -947,7 +1264,6 @@ class _SellMedicineAndInventoryPageState
                     ),
                   ),
                   const SizedBox(height: 14),
-                  // ── SALE TYPE CHIPS ─────────────────────────
                   const Text(
                     'Sell as:',
                     style: TextStyle(color: Colors.white70, fontSize: 13),
@@ -987,7 +1303,6 @@ class _SellMedicineAndInventoryPageState
                     ],
                   ),
                   const SizedBox(height: 14),
-                  // ── QUANTITY INPUT ──────────────────────────
                   if (saleType == 'strip' || saleType == 'box') ...[
                     TextField(
                       controller: qtyCtrl,
@@ -1139,7 +1454,6 @@ class _SellMedicineAndInventoryPageState
                     ),
                     const SizedBox(height: 10),
                   ],
-                  // ── CUSTOMER FIELDS ─────────────────────────
                   TextField(
                     controller: customerCtrl,
                     style: const TextStyle(color: Colors.white),
@@ -1179,7 +1493,6 @@ class _SellMedicineAndInventoryPageState
                     ),
                   ),
                   const SizedBox(height: 14),
-                  // ── OTP WARNING BOX ─────────────────────────
                   Container(
                     padding: const EdgeInsets.all(10),
                     decoration: BoxDecoration(
@@ -1220,7 +1533,6 @@ class _SellMedicineAndInventoryPageState
                     ),
                   ),
                   const SizedBox(height: 14),
-                  // ── TOTAL BOX ───────────────────────────────
                   Container(
                     padding: const EdgeInsets.all(14),
                     decoration: BoxDecoration(
@@ -1832,10 +2144,6 @@ class _SellMedicineAndInventoryPageState
   }
 
   // ── COMPLETE SALE (FIFO across batches) ────────────────────
-  //
-  // Deducts strips starting from the earliest-expiry batch.
-  // When a batch hits 0 strips it is soft-deleted (is_active = false).
-  // A single sales record is inserted with all batch numbers used.
 
   Future<void> _completeSale({
     required List<Map<String, dynamic>> batches,
@@ -1851,16 +2159,14 @@ class _SellMedicineAndInventoryPageState
     try {
       final userId = supabase.auth.currentUser?.id;
 
-      // Total strips across all batches being sold from.
       int totalStripsAvailable = 0;
       for (final b in batches) {
         totalStripsAvailable += (b['strips_remaining'] as int?) ?? 0;
       }
 
-      // How many strips this sale needs to remove.
       int stripsToDeduct;
       if (saleType == 'carton') {
-        stripsToDeduct = totalStripsAvailable; // clear everything
+        stripsToDeduct = totalStripsAvailable;
       } else if (saleType == 'box') {
         stripsToDeduct = qty * stripsPerBox;
       } else {
@@ -1871,7 +2177,6 @@ class _SellMedicineAndInventoryPageState
       final Set<String> cartonIdsTouched = {};
       int remainingToDeduct = stripsToDeduct;
 
-      // Walk through batches FIFO (already sorted by _buildGroups).
       for (final b in batches) {
         if (remainingToDeduct <= 0) break;
 
@@ -1889,7 +2194,6 @@ class _SellMedicineAndInventoryPageState
             : 0;
 
         if (newBoxes <= 0) {
-          // Soft-delete: archive this batch, keep it for history.
           await supabase
               .from('medicine_boxes')
               .update({
@@ -1914,7 +2218,6 @@ class _SellMedicineAndInventoryPageState
           ? 'N/A'
           : batchNumbersUsed.join(', ');
 
-      // Insert a single sales record for this transaction.
       await supabase.from('sales').insert({
         'medicine_name': medicineName,
         'batch_number': batchNumberForSale,
@@ -1936,7 +2239,6 @@ class _SellMedicineAndInventoryPageState
       _loadMedicines();
       _loadManufacturers();
 
-      // Calculate remaining stock for the receipt.
       final int newTotalStrips = (totalStripsAvailable - stripsToDeduct).clamp(
         0,
         totalStripsAvailable,
@@ -2337,8 +2639,6 @@ class _SellMedicineAndInventoryPageState
                   selectedUnit = foundUnit;
                   isCustomUnit = false;
                 }
-                // NOTE: batch_number is intentionally NOT auto-filled from
-                // a scan — each new receipt must have its OWN unique batch.
               });
             } else {
               setDs(() {
@@ -2394,7 +2694,6 @@ class _SellMedicineAndInventoryPageState
                     ),
                   ),
                   const SizedBox(height: 12),
-                  // Barcode scan button
                   Row(
                     children: [
                       Expanded(
@@ -2521,7 +2820,6 @@ class _SellMedicineAndInventoryPageState
                     ),
                   ),
                   const SizedBox(height: 10),
-                  // Expiry date picker
                   TextField(
                     controller: expiryCtrl,
                     readOnly: true,
@@ -2586,7 +2884,6 @@ class _SellMedicineAndInventoryPageState
                     isDecimal: true,
                   ),
                   const SizedBox(height: 10),
-                  // Unit dropdown
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 12),
                     decoration: BoxDecoration(
@@ -2635,7 +2932,6 @@ class _SellMedicineAndInventoryPageState
                     _dialogField(customUnitCtrl, 'Custom Unit', Icons.edit),
                   ],
                   const SizedBox(height: 14),
-                  // Shelf location
                   Container(
                     padding: const EdgeInsets.all(10),
                     decoration: BoxDecoration(
@@ -2760,9 +3056,6 @@ class _SellMedicineAndInventoryPageState
                   }
 
                   try {
-                    // ── UNIQUE BATCH NUMBER CHECK ──────────────
-                    // A batch number must be unique within this pharmacy.
-                    // When editing, we exclude the current row from the check.
                     final dupCheck = await supabase
                         .from('medicine_boxes')
                         .select('id')
@@ -2804,8 +3097,6 @@ class _SellMedicineAndInventoryPageState
                           .eq('id', existingId);
                       _success('Medicine box updated!');
                     } else {
-                      // Always INSERT a new row for new stock receipts.
-                      // Never upsert — we want a fresh batch row each time.
                       await supabase.from('medicine_boxes').insert({
                         'carton_id': cartonId,
                         'medicine_name': name,
@@ -4125,6 +4416,17 @@ class _SellMedicineAndInventoryPageState
                           ],
                         ),
                       ),
+                      // ── NEW: Archive button in top bar ──────
+                      // Tapping the archive icon opens the list of
+                      // all archived medicines where the user can restore them.
+                      IconButton(
+                        icon: const Icon(
+                          Icons.archive_outlined,
+                          color: Colors.orangeAccent,
+                        ),
+                        tooltip: 'View Archived Medicines',
+                        onPressed: _showArchivedMedicines,
+                      ),
                       IconButton(
                         icon: const Icon(Icons.refresh, color: Colors.white),
                         onPressed: () {
@@ -4183,14 +4485,7 @@ class _SellMedicineAndInventoryPageState
     );
   }
 
-  // ── TAB 1: SELL (grouped by trade name / medicine_name) ────
-  //
-  // POINT 2: Shows ONE card per trade name with TOTAL combined stock.
-  // Example: Napa NP001 (10) + Napa NP002 (15) + Napa NP003 (5) = 1 Napa entry (30 total)
-  //
-  // POINT 3: Low stock badge fires when TOTAL boxes <= _lowStockThreshold (5).
-  // NOT per-batch. Example: 2+2+1 = 5 total → show LOW STOCK.
-  //                          10+8+4 = 22 total → no LOW STOCK.
+  // ── TAB 1: SELL ────────────────────────────────────────────
 
   Widget _buildSellTab() {
     final List<Map<String, dynamic>> groups = _buildGroups();
@@ -4285,9 +4580,6 @@ class _SellMedicineAndInventoryPageState
                     final Color statusColor = _expiryColor(earliestExpiry);
                     final bool outOfStock = !allExpired && totalBoxes <= 0;
 
-                    // POINT 3: Low stock uses COMBINED total across all batches
-                    // Threshold is _lowStockThreshold (5 boxes)
-                    // NOT per-batch quantity check
                     final bool lowStock =
                         !allExpired &&
                         totalBoxes > 0 &&
@@ -4304,7 +4596,7 @@ class _SellMedicineAndInventoryPageState
                           : const Color.fromRGBO(255, 255, 255, 0.10),
                       margin: const EdgeInsets.only(bottom: 10),
                       child: InkWell(
-                        onTap: () => _showSellDialog(g),
+                        onTap: allExpired ? null : () => _showSellDialog(g),
                         borderRadius: BorderRadius.circular(12),
                         child: Padding(
                           padding: const EdgeInsets.all(12),
@@ -4400,9 +4692,6 @@ class _SellMedicineAndInventoryPageState
                                       _expiryLabel(earliestExpiry),
                                       statusColor,
                                     ),
-                                  // Low stock badge: based on COMBINED total
-                                  // boxes across all batches of this trade name.
-                                  // Fires when totalBoxes <= _lowStockThreshold (5).
                                   if (lowStock)
                                     _badge(
                                       '⚠️ LOW STOCK (≤$_lowStockThreshold)',
@@ -4493,9 +4782,6 @@ class _SellMedicineAndInventoryPageState
   }
 
   // ── TAB 2: INVENTORY ───────────────────────────────────────
-  // Shows manufacturers → tap to see cartons → tap to see each
-  // individual batch row. Unchanged from original design.
-  // Inventory tab intentionally keeps batch-wise view.
 
   Widget _buildInventoryTab() {
     return loadingManufacturers

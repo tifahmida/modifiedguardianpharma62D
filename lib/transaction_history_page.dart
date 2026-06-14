@@ -26,20 +26,15 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
 
   // ── UNDO DELETE STATE ──────────────────────────────────────
   //
-  // NEW DESIGN:
-  // 1. Delete from Supabase IMMEDIATELY when Delete is pressed,
-  //    and verify it actually deleted something (using .select()).
+  // 1. Delete from Supabase IMMEDIATELY when Delete is pressed.
   // 2. Keep a local backup copy (_deletedSale) during the undo window.
-  // 3. Show a SnackBar with an UNDO action for 5 seconds.
-  // 4. The SnackBar's own `.closed` future is the SINGLE SOURCE OF TRUTH
-  //    for when the undo window ends — no separate competing Timer.
-  //    - If closed because UNDO was pressed -> restore the row.
-  //    - If closed for any other reason (timeout, swipe, replaced by
-  //      another snackbar) -> finalize deletion (clear backup).
-  // 5. Refresh always shows the real DB state (already deleted).
+  // 3. Show a SnackBar with UNDO action for 5 seconds.
+  // 4. SnackBar's .closed future is the SINGLE source of truth:
+  //    - UNDO pressed  → restore the row back to Supabase
+  //    - Timeout/swipe → finalize deletion (clear backup)
 
-  Map<String, dynamic>? _deletedSale; // backup copy for potential UNDO
-  bool _undoAvailable = false; // true only during the undo window
+  Map<String, dynamic>? _deletedSale;
+  bool _undoAvailable = false;
 
   @override
   void initState() {
@@ -79,9 +74,8 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
 
   Future<void> _loadSales() async {
     // If user refreshes during an undo window, finalize that pending
-    // delete cleanly. The row is already deleted in Supabase so refresh
-    // will not bring it back. We just discard the local backup so UNDO
-    // no longer works for that row.
+    // delete cleanly. Row is already gone from Supabase — just discard
+    // the backup so UNDO no longer works for that row.
     if (_undoAvailable) {
       if (mounted) ScaffoldMessenger.of(context).clearSnackBars();
       _deletedSale = null;
@@ -158,16 +152,26 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
   }
 
   // ── FETCH SUSPICIOUS LOG FOR A SALE ──────────────────────
+  //
+  // Looks up suspicious_logs for this pharmacy + medicine_name +
+  // activity_type, then picks the entry whose created_at timestamp
+  // is closest to the sale's created_at (within 10 minutes).
+  //
+  // NOTE: We intentionally do NOT filter by batch_number or quantity
+  // in the query itself, because the way those values are joined/saved
+  // (e.g. "24001, 24002" for multi-batch FIFO sales, or quantity meaning
+  // "boxes" vs "strip equivalent") can cause exact-match filters to miss
+  // the correct log even though it belongs to this sale. Matching by
+  // medicine + time window is simple and reliable for this project.
+  // Returns null if no matching log found → no warning shown.
 
   Future<Map<String, dynamic>?> _fetchSuspiciousLog(
     Map<String, dynamic> sale,
   ) async {
     try {
       final String medicineName = sale['medicine_name']?.toString() ?? '';
-      final String batchNumber = sale['batch_number']?.toString() ?? '';
       final String pharmacyId = PharmacySession.pharmacyId ?? '';
       final String saleCreatedAt = sale['created_at']?.toString() ?? '';
-      final int saleQty = (sale['quantity_sold'] as int?) ?? 0;
 
       if (medicineName.isEmpty || saleCreatedAt.isEmpty) return null;
 
@@ -179,65 +183,47 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
           .select()
           .eq('pharmacy_id', pharmacyId)
           .eq('medicine_name', medicineName)
-          .eq('batch_number', batchNumber)
           .eq('activity_type', 'high_quantity_purchase')
-          .eq('quantity', saleQty)
           .order('created_at', ascending: false);
 
       final List<Map<String, dynamic>> results =
           List<Map<String, dynamic>>.from(res);
 
+      Map<String, dynamic>? bestMatch;
+      int bestDiff = 11; // anything outside the 10-minute window is ignored
+
       for (final log in results) {
         final String logCreatedAt = log['created_at']?.toString() ?? '';
         final DateTime? logTime = DateTime.tryParse(logCreatedAt);
         if (logTime == null) continue;
+
         final int minutesDiff = saleTime.difference(logTime).inMinutes.abs();
-        if (minutesDiff <= 10) return log;
+        if (minutesDiff <= 10 && minutesDiff < bestDiff) {
+          bestDiff = minutesDiff;
+          bestMatch = log;
+        }
       }
 
-      return null;
+      return bestMatch;
     } catch (e) {
       return null;
     }
   }
 
   // ── DELETE WITH UNDO ──────────────────────────────────────
-  //
-  // STEP 1: If there is already a pending undo from a previous delete,
-  //         finalize it (the row was already deleted from Supabase),
-  //         and clear its backup + close its SnackBar.
-  //
-  // STEP 2: Delete the new row from Supabase RIGHT NOW, and VERIFY it
-  //         actually deleted a row using .select(). If RLS blocks the
-  //         delete, Supabase returns an empty list instead of an error
-  //         — so we must check for that and stop if nothing was deleted.
-  //
-  // STEP 3: Save a local backup copy so UNDO can re-insert it if needed.
-  //
-  // STEP 4: Remove the row from the local UI list immediately.
-  //
-  // STEP 5: Show a SnackBar for 5 seconds with an UNDO button. The
-  //         SnackBar's own `.closed` future decides what happens next:
-  //         - closed via UNDO button -> restore the row
-  //         - closed any other way (timeout/swipe/replaced) -> finalize
-  //           the deletion permanently (just clear the backup; the DB
-  //           row is already gone)
 
   Future<void> _deleteWithUndo(Map<String, dynamic> sale) async {
-    // ── STEP 1: Finalize previous undo window (if any) ────
-    // The previous deleted row is already gone from Supabase.
-    // We just throw away its local backup and close its SnackBar.
+    // STEP 1: Finalize any previous undo window
     if (_undoAvailable) {
       if (mounted) ScaffoldMessenger.of(context).clearSnackBars();
       _deletedSale = null;
       _undoAvailable = false;
     }
 
-    // ── STEP 2: Delete from Supabase IMMEDIATELY, and verify ──
-    // .select() makes Supabase return the row(s) it actually deleted.
-    // If RLS policies block the delete, Supabase does NOT throw an
-    // error — it just deletes 0 rows silently. So we check the result
-    // length to know if the delete really happened.
+    // STEP 2: Delete from Supabase IMMEDIATELY and verify it worked.
+    // .select() makes Supabase return the rows it actually deleted.
+    // If RLS blocks the delete, Supabase silently deletes 0 rows
+    // instead of throwing an error — so we check the result length.
     try {
       final deleteResult = await supabase
           .from('sales')
@@ -246,35 +232,34 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
           .select();
 
       if (deleteResult.isEmpty) {
-        // Nothing was actually deleted (permission denied or row gone)
         if (mounted) {
-          Navigator.pop(context); // close the bottom sheet
+          Navigator.pop(context);
           _error('Delete failed: permission denied or transaction not found.');
         }
         return;
       }
     } catch (e) {
       if (mounted) {
-        Navigator.pop(context); // close the bottom sheet
+        Navigator.pop(context);
         _error('Could not delete transaction. Please try again.');
       }
       return;
     }
 
-    // ── STEP 3: Save a local backup for potential UNDO ────
+    // STEP 3: Save a local backup for potential UNDO
     _deletedSale = Map<String, dynamic>.from(sale);
     _undoAvailable = true;
 
-    // ── STEP 4: Remove from local UI list immediately ─────
+    // STEP 4: Remove from local UI list immediately and recalculate totals
     setState(() {
       sales.removeWhere((s) => s['id'] == sale['id']);
       _recalculateTotals();
     });
 
-    // ── Close the bottom sheet ────────────────────────────
+    // Close the bottom sheet
     if (mounted) Navigator.pop(context);
 
-    // ── STEP 5: Show SnackBar for 5 seconds ──────────────
+    // STEP 5: Show SnackBar for 5 seconds with UNDO button
     if (!mounted) return;
     ScaffoldMessenger.of(context).clearSnackBars();
 
@@ -287,9 +272,6 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
           label: 'UNDO',
           textColor: Colors.blueAccent,
           onPressed: () {
-            // User pressed UNDO — mark it as handled and restore the row.
-            // The SnackBar's `.closed` future below will see that this
-            // was closed via the action and will NOT finalize deletion.
             _undoAvailable = false;
             _restoreDeletedSale();
           },
@@ -297,15 +279,11 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
       ),
     );
 
-    // This future completes when the SnackBar disappears, for ANY
-    // reason (timeout, swiped away, replaced by another SnackBar).
-    // This is now the SINGLE place that decides whether the deletion
-    // becomes permanent.
+    // SnackBar .closed future is the SINGLE place that decides whether
+    // deletion becomes permanent.
     snackBarController.closed.then((reason) {
       if (reason != SnackBarClosedReason.action) {
-        // Not closed via the UNDO button -> deletion is now permanent.
-        // The row is already gone from Supabase, so we just drop the
-        // local backup. Nothing else needs to happen.
+        // Not UNDO → deletion is permanent. Row already gone from DB.
         _deletedSale = null;
         _undoAvailable = false;
       }
@@ -313,42 +291,29 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
   }
 
   // ── RESTORE DELETED SALE (UNDO pressed) ──────────────────
-  //
-  // Re-inserts the backup row into Supabase, then refreshes the list.
 
   Future<void> _restoreDeletedSale() async {
     if (_deletedSale == null) return;
 
-    // Take a local reference before clearing the state variable
     final Map<String, dynamic> rowToRestore = Map<String, dynamic>.from(
       _deletedSale!,
     );
-    rowToRestore.remove(
-      'profiles',
-    ); // 'profiles' is a join artifact, not a real column
+    // 'profiles' is a join artifact, not a real column — remove before insert
+    rowToRestore.remove('profiles');
 
-    // Clear backup before the async call so a double-tap cannot trigger twice
+    // Clear backup before async call to prevent double-tap
     _deletedSale = null;
 
     try {
       await supabase.from('sales').insert(rowToRestore);
-
-      // Refresh the list from Supabase to get the restored row
       await _loadSales();
 
       if (mounted) {
         ScaffoldMessenger.of(context).clearSnackBars();
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Transaction restored successfully'),
-            backgroundColor: Colors.green,
-            duration: Duration(seconds: 2),
-          ),
-        );
+        _success('Transaction restored successfully');
       }
     } catch (e) {
       _error('Could not restore transaction: $e');
-      // Reload anyway so list is consistent with DB
       _loadSales();
     }
   }
@@ -388,10 +353,13 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
         initialChildSize: 0.55,
         maxChildSize: 0.95,
         builder: (_, ctrl) => FutureBuilder<Map<String, dynamic>?>(
+          // Load the suspicious log while the sheet is opening
           future: _fetchSuspiciousLog(sale),
           builder: (ctx, snapshot) {
             final Map<String, dynamic>? suspLog = snapshot.data;
 
+            // Parse the description stored in suspicious_logs.
+            // Format: "CustomerName (age X, phone) purchased Y units of Z. Reason: ..."
             String customerNameFromLog = '';
             String customerAgeFromLog = '';
             String reasonFromLog = '';
@@ -399,15 +367,18 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
             if (suspLog != null) {
               final String desc = suspLog['description']?.toString() ?? '';
 
+              // Extract reason — everything after "Reason: "
               if (desc.contains('Reason: ')) {
                 reasonFromLog = desc.split('Reason: ').last.trim();
               }
 
+              // Extract age — looks for "(age 25,"
               final ageMatch = RegExp(r'\(age (\d+),').firstMatch(desc);
               if (ageMatch != null) {
                 customerAgeFromLog = ageMatch.group(1) ?? '';
               }
 
+              // Extract customer name — everything before " (age"
               if (desc.contains(' (age')) {
                 customerNameFromLog = desc.split(' (age').first.trim();
               }
@@ -440,6 +411,7 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
                   const SizedBox(height: 16),
                   const Divider(color: Colors.white24),
 
+                  // Basic sale info rows
                   _row(
                     '💊 Medicine',
                     sale['medicine_name']?.toString() ?? 'N/A',
@@ -456,6 +428,7 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
                   ),
                   const Divider(color: Colors.white24),
 
+                  // Total amount
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
@@ -479,6 +452,7 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
                   ),
                   const SizedBox(height: 8),
 
+                  // Staff and customer info from sales table
                   _row(
                     '👨‍⚕️ Sold By',
                     sale['profiles']?['full_name']?.toString() ?? 'Unknown',
@@ -491,6 +465,9 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
                   if ((sale['customer_phone']?.toString() ?? '').isNotEmpty)
                     _row('📱 Phone', sale['customer_phone']?.toString() ?? ''),
 
+                  // ── HIGH QUANTITY WARNING SECTION ─────────────────────
+                  // Only shown when a suspicious log exists for this sale.
+                  // This means the sale exceeded the safe limit and required OTP.
                   if (suspLog != null) ...[
                     const SizedBox(height: 16),
                     Container(
@@ -506,6 +483,7 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
+                          // Section header badge
                           const Row(
                             children: [
                               Icon(
@@ -533,12 +511,15 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
                           ),
                           const SizedBox(height: 10),
 
+                          // Customer name parsed from log description
                           if (customerNameFromLog.isNotEmpty)
                             _logRow('👤 Customer Name', customerNameFromLog),
 
+                          // Age parsed from log description
                           if (customerAgeFromLog.isNotEmpty)
                             _logRow('🎂 Age', '$customerAgeFromLog years'),
 
+                          // Quantity that was flagged
                           _logRow(
                             '🔢 Quantity Flagged',
                             '${suspLog['quantity']?.toString() ?? sale['quantity_sold']?.toString() ?? '0'} units',
@@ -546,6 +527,7 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
 
                           const SizedBox(height: 10),
 
+                          // Reason box
                           Container(
                             width: double.infinity,
                             padding: const EdgeInsets.all(12),
@@ -604,7 +586,7 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
 
                   const SizedBox(height: 16),
 
-                  // ── DELETE BUTTON ──────────────────────────
+                  // ── DELETE BUTTON ──────────────────────────────────────
                   SizedBox(
                     width: double.infinity,
                     child: ElevatedButton.icon(
@@ -631,6 +613,7 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
 
   // ── ROW WIDGETS ───────────────────────────────────────────
 
+  // Standard info row used throughout the receipt
   Widget _row(String label, String value) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
@@ -657,6 +640,7 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
     );
   }
 
+  // Orange-tinted row used inside the suspicious log section
   Widget _logRow(String label, String value) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 3),
@@ -686,9 +670,15 @@ class _TransactionHistoryPageState extends State<TransactionHistoryPage> {
     );
   }
 
+  // ── SNACKBAR HELPERS ──────────────────────────────────────
+
   void _error(String msg) => ScaffoldMessenger.of(
     context,
   ).showSnackBar(SnackBar(content: Text(msg), backgroundColor: Colors.red));
+
+  void _success(String msg) => ScaffoldMessenger.of(
+    context,
+  ).showSnackBar(SnackBar(content: Text(msg), backgroundColor: Colors.green));
 
   // ── BUILD ─────────────────────────────────────────────────
 
